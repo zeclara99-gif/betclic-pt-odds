@@ -1,0 +1,454 @@
+name: Betclic PT odds snapshots
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: betclic-pt-odds
+  cancel-in-progress: true
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned Betclic client
+        run: |
+          python -m pip install --upgrade pip
+          pip install "git+https://github.com/TapsHTS/betclic-api.git@5989c0936e17c98fff392dc20f5d2e8e4048c04e"
+
+      - name: Build fetcher
+        run: |
+          cat > /tmp/fetch_betclic_pt.py <<'PY'
+          import argparse
+          import json
+          import time
+          from dataclasses import asdict, is_dataclass
+          from datetime import datetime, timedelta, timezone
+
+          import betclic_api.client as bc
+          from betclic_api import BetclicClient
+
+          bc._HEADERS.update({
+              "x-bg-regulation": "PT",
+              "x-bg-ref-regulator-zone": "PT",
+              "Origin": "https://www.betclic.pt",
+              "Referer": "https://www.betclic.pt/",
+              "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
+          })
+
+          def clean(obj):
+              if is_dataclass(obj):
+                  return {
+                      k: clean(v)
+                      for k, v in asdict(obj).items()
+                  }
+
+              if isinstance(obj, dict):
+                  return {
+                      str(k): clean(v)
+                      for k, v in obj.items()
+                  }
+
+              if isinstance(obj, (list, tuple)):
+                  return [
+                      clean(v)
+                      for v in obj
+                  ]
+
+              if isinstance(obj, bytes):
+                  return obj.hex()
+
+              return obj
+
+          def parse_dt(value):
+              if not value:
+                  return None
+
+              try:
+                  return datetime.fromisoformat(
+                      str(value).replace("Z", "+00:00")
+                  )
+              except Exception:
+                  return None
+
+          def list_all(
+              client,
+              sport,
+              max_pages=12
+          ):
+              out = []
+              offset = 0
+              seen = set()
+
+              for _ in range(max_pages):
+                  result = client.get_matches(
+                      sport,
+                      offset=offset
+                  )
+
+                  batch = (
+                      result.get("matches", [])
+                      or []
+                  )
+
+                  if not batch:
+                      break
+
+                  new_count = 0
+
+                  for match in batch:
+                      mid = getattr(
+                          match,
+                          "id",
+                          None
+                      )
+
+                      if mid in seen:
+                          continue
+
+                      seen.add(mid)
+                      out.append(match)
+                      new_count += 1
+
+                  total = int(
+                      result.get("total", 0)
+                      or 0
+                  )
+
+                  offset += len(batch)
+
+                  if (
+                      not new_count
+                      or (
+                          total
+                          and offset >= total
+                      )
+                  ):
+                      break
+
+                  time.sleep(0.12)
+
+              return out
+
+          def detailed(
+              client,
+              matches,
+              cap
+          ):
+              rows = []
+              failures = 0
+
+              for match in matches[:cap]:
+                  try:
+                      full = client.get_match(
+                          int(match.id)
+                      )
+
+                      rows.append(
+                          clean(full)
+                      )
+
+                  except Exception as exc:
+                      base = clean(match)
+
+                      if isinstance(
+                          base,
+                          dict
+                      ):
+                          base[
+                              "_detail_error"
+                          ] = type(exc).__name__
+
+                      rows.append(base)
+                      failures += 1
+
+                  time.sleep(0.12)
+
+              return rows, failures
+
+          def collect(mode):
+              now = datetime.now(
+                  timezone.utc
+              )
+
+              client = BetclicClient(
+                  locale="pt",
+                  timeout=(5, 10)
+              )
+
+              result = {
+                  "generated_at": (
+                      now.isoformat()
+                  ),
+                  "mode": mode,
+                  "source": {
+                      "provider": (
+                          "Betclic public "
+                          "offering backend"
+                      ),
+                      "brand": "BETCLIC",
+                      "regulation": "PT",
+                      "origin": (
+                          "https://www.betclic.pt"
+                      ),
+                      "client": (
+                          "TapsHTS/betclic-api"
+                          "@5989c0936e17c98fff392"
+                          "dc20f5d2e8e4048c04e"
+                      ),
+                  },
+                  "sports": {},
+              }
+
+              for sport in (
+                  "football",
+                  "tennis"
+              ):
+                  base = list_all(
+                      client,
+                      sport
+                  )
+
+                  if mode == "live":
+                      selected = [
+                          m
+                          for m in base
+                          if bool(
+                              getattr(
+                                  m,
+                                  "is_live",
+                                  False
+                              )
+                          )
+                      ]
+
+                      cap = (
+                          100
+                          if sport == "football"
+                          else 120
+                      )
+
+                  else:
+                      horizon = (
+                          now
+                          + timedelta(
+                              hours=72
+                          )
+                      )
+
+                      selected = []
+
+                      for m in base:
+                          dt = parse_dt(
+                              getattr(
+                                  m,
+                                  "date",
+                                  None
+                              )
+                          )
+
+                          if dt is None:
+                              continue
+
+                          if not (
+                              now
+                              <= dt
+                              <= horizon
+                          ):
+                              continue
+
+                          if sport == "tennis":
+                              comp = str(
+                                  getattr(
+                                      m,
+                                      "competition",
+                                      ""
+                                  )
+                                  or ""
+                              ).upper()
+
+                              if (
+                                  "ATP"
+                                  not in comp
+                                  and
+                                  "WTA"
+                                  not in comp
+                              ):
+                                  continue
+
+                          selected.append(m)
+
+                      selected.sort(
+                          key=lambda m:
+                          parse_dt(
+                              getattr(
+                                  m,
+                                  "date",
+                                  None
+                              )
+                          )
+                          or datetime.max.replace(
+                              tzinfo=timezone.utc
+                          )
+                      )
+
+                      cap = (
+                          180
+                          if sport == "football"
+                          else 120
+                      )
+
+                  rows, failures = detailed(
+                      client,
+                      selected,
+                      cap
+                  )
+
+                  result[
+                      "sports"
+                  ][sport] = {
+                      "discovered": len(base),
+                      "selected": len(selected),
+                      "included": len(rows),
+                      "detail_failures": failures,
+                      "matches": rows,
+                  }
+
+              return result
+
+          parser = argparse.ArgumentParser()
+
+          parser.add_argument(
+              "--mode",
+              choices=(
+                  "live",
+                  "upcoming"
+              ),
+              required=True
+          )
+
+          parser.add_argument(
+              "--output",
+              required=True
+          )
+
+          args = parser.parse_args()
+
+          payload = collect(
+              args.mode
+          )
+
+          with open(
+              args.output,
+              "w",
+              encoding="utf-8"
+          ) as fh:
+              json.dump(
+                  payload,
+                  fh,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+              fh.write("\n")
+          PY
+
+      - name: Fetch live snapshot
+        run: |
+          python /tmp/fetch_betclic_pt.py \
+            --mode live \
+            --output /tmp/live.json
+
+      - name: Publish live snapshot
+        env:
+          GH_PUSH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          dir="$(mktemp -d)"
+
+          cp /tmp/live.json \
+            "$dir/live.json"
+
+          cd "$dir"
+
+          git init -b live-data
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add live.json
+
+          git commit \
+            -m "Update Betclic PT live odds"
+
+          git remote add origin \
+            "https://x-access-token:${GH_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          git push \
+            --force \
+            origin \
+            HEAD:live-data
+
+      - name: Fetch upcoming snapshot
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '17 */6 * * *'
+        run: |
+          python /tmp/fetch_betclic_pt.py \
+            --mode upcoming \
+            --output /tmp/upcoming.json
+
+      - name: Publish upcoming snapshot
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '17 */6 * * *'
+        env:
+          GH_PUSH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          dir="$(mktemp -d)"
+
+          cp /tmp/upcoming.json \
+            "$dir/upcoming.json"
+
+          cd "$dir"
+
+          git init -b upcoming-data
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add upcoming.json
+
+          git commit \
+            -m "Update Betclic PT upcoming odds"
+
+          git remote add origin \
+            "https://x-access-token:${GH_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          git push \
+            --force \
+            origin \
+            HEAD:upcoming-data
