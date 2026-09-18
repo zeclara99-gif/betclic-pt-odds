@@ -16,7 +16,7 @@ concurrency:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install pinned Betclic client
+      - name: Install Betclic client
         run: |
           python -m pip install --upgrade pip
           pip install "git+https://github.com/TapsHTS/betclic-api.git@5989c0936e17c98fff392dc20f5d2e8e4048c04e"
@@ -35,7 +35,7 @@ jobs:
           cat > /tmp/fetch_betclic_pt.py <<'PY'
           import argparse
           import json
-          import time
+          from concurrent.futures import ThreadPoolExecutor
           from dataclasses import asdict, is_dataclass
           from datetime import datetime, timedelta, timezone
 
@@ -49,6 +49,12 @@ jobs:
               "Referer": "https://www.betclic.pt/",
               "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
           })
+
+          def client():
+              return BetclicClient(
+                  locale="pt",
+                  timeout=(3, 6)
+              )
 
           def clean(obj):
               if is_dataclass(obj):
@@ -64,10 +70,7 @@ jobs:
                   }
 
               if isinstance(obj, (list, tuple)):
-                  return [
-                      clean(v)
-                      for v in obj
-                  ]
+                  return [clean(v) for v in obj]
 
               if isinstance(obj, bytes):
                   return obj.hex()
@@ -80,35 +83,42 @@ jobs:
 
               try:
                   return datetime.fromisoformat(
-                      str(value).replace("Z", "+00:00")
+                      str(value).replace(
+                          "Z",
+                          "+00:00"
+                      )
                   )
               except Exception:
                   return None
 
-          def list_all(
-              client,
+          def get_live(sport):
+              return client().get_live(sport)
+
+          def get_upcoming(
               sport,
-              max_pages=12
+              max_pages=5
           ):
-              out = []
-              offset = 0
+              c = client()
+              rows = []
               seen = set()
+              offset = 0
 
               for _ in range(max_pages):
-                  result = client.get_matches(
+                  result = c.get_matches(
                       sport,
                       offset=offset
                   )
 
                   batch = (
-                      result.get("matches", [])
+                      result.get(
+                          "matches",
+                          []
+                      )
                       or []
                   )
 
                   if not batch:
                       break
-
-                  new_count = 0
 
                   for match in batch:
                       mid = getattr(
@@ -121,62 +131,86 @@ jobs:
                           continue
 
                       seen.add(mid)
-                      out.append(match)
-                      new_count += 1
+                      rows.append(match)
 
                   total = int(
-                      result.get("total", 0)
+                      result.get(
+                          "total",
+                          0
+                      )
                       or 0
                   )
 
                   offset += len(batch)
 
                   if (
-                      not new_count
-                      or (
-                          total
-                          and offset >= total
-                      )
+                      total
+                      and offset >= total
                   ):
                       break
 
-                  time.sleep(0.12)
+              return rows
 
-              return out
+          def get_detail(match):
+              try:
+                  full = client().get_match(
+                      int(match.id)
+                  )
 
-          def detailed(
-              client,
+                  return (
+                      clean(full),
+                      False
+                  )
+
+              except Exception as exc:
+                  base = clean(match)
+
+                  if isinstance(
+                      base,
+                      dict
+                  ):
+                      base[
+                          "_detail_error"
+                      ] = type(exc).__name__
+
+                  return (
+                      base,
+                      True
+                  )
+
+          def details(
               matches,
               cap
           ):
-              rows = []
-              failures = 0
+              matches = list(
+                  matches[:cap]
+              )
 
-              for match in matches[:cap]:
-                  try:
-                      full = client.get_match(
-                          int(match.id)
+              if not matches:
+                  return [], 0
+
+              with ThreadPoolExecutor(
+                  max_workers=8
+              ) as pool:
+                  results = list(
+                      pool.map(
+                          get_detail,
+                          matches
                       )
+                  )
 
-                      rows.append(
-                          clean(full)
-                      )
+              rows = [
+                  row
+                  for row, _
+                  in results
+              ]
 
-                  except Exception as exc:
-                      base = clean(match)
-
-                      if isinstance(
-                          base,
-                          dict
-                      ):
-                          base[
-                              "_detail_error"
-                          ] = type(exc).__name__
-
-                      rows.append(base)
-                      failures += 1
-
-                  time.sleep(0.12)
+              failures = sum(
+                  1
+                  for _, failed
+                  in results
+                  if failed
+              )
 
               return rows, failures
 
@@ -185,64 +219,46 @@ jobs:
                   timezone.utc
               )
 
-              client = BetclicClient(
-                  locale="pt",
-                  timeout=(5, 10)
-              )
-
-              result = {
-                  "generated_at": (
-                      now.isoformat()
-                  ),
+              output = {
+                  "generated_at":
+                      now.isoformat(),
                   "mode": mode,
                   "source": {
-                      "provider": (
-                          "Betclic public "
-                          "offering backend"
-                      ),
-                      "brand": "BETCLIC",
-                      "regulation": "PT",
-                      "origin": (
+                      "provider":
+                          "Betclic public offering backend",
+                      "brand":
+                          "BETCLIC",
+                      "regulation":
+                          "PT",
+                      "origin":
                           "https://www.betclic.pt"
-                      ),
-                      "client": (
-                          "TapsHTS/betclic-api"
-                          "@5989c0936e17c98fff392"
-                          "dc20f5d2e8e4048c04e"
-                      ),
                   },
-                  "sports": {},
+                  "sports": {}
               }
 
               for sport in (
                   "football",
                   "tennis"
               ):
-                  base = list_all(
-                      client,
-                      sport
-                  )
 
                   if mode == "live":
-                      selected = [
-                          m
-                          for m in base
-                          if bool(
-                              getattr(
-                                  m,
-                                  "is_live",
-                                  False
-                              )
-                          )
-                      ]
+                      base = get_live(
+                          sport
+                      )
+
+                      selected = list(base)
 
                       cap = (
-                          100
+                          60
                           if sport == "football"
-                          else 120
+                          else 80
                       )
 
                   else:
+                      base = get_upcoming(
+                          sport
+                      )
+
                       horizon = (
                           now
                           + timedelta(
@@ -252,10 +268,10 @@ jobs:
 
                       selected = []
 
-                      for m in base:
+                      for match in base:
                           dt = parse_dt(
                               getattr(
-                                  m,
+                                  match,
                                   "date",
                                   None
                               )
@@ -272,9 +288,9 @@ jobs:
                               continue
 
                           if sport == "tennis":
-                              comp = str(
+                              competition = str(
                                   getattr(
-                                      m,
+                                      match,
                                       "competition",
                                       ""
                                   )
@@ -283,52 +299,58 @@ jobs:
 
                               if (
                                   "ATP"
-                                  not in comp
+                                  not in competition
                                   and
                                   "WTA"
-                                  not in comp
+                                  not in competition
                               ):
                                   continue
 
-                          selected.append(m)
+                          selected.append(
+                              match
+                          )
 
                       selected.sort(
                           key=lambda m:
-                          parse_dt(
-                              getattr(
-                                  m,
-                                  "date",
-                                  None
+                              parse_dt(
+                                  getattr(
+                                      m,
+                                      "date",
+                                      None
+                                  )
                               )
-                          )
-                          or datetime.max.replace(
-                              tzinfo=timezone.utc
-                          )
+                              or datetime.max.replace(
+                                  tzinfo=timezone.utc
+                              )
                       )
 
                       cap = (
-                          180
+                          120
                           if sport == "football"
-                          else 120
+                          else 80
                       )
 
-                  rows, failures = detailed(
-                      client,
+                  rows, failures = details(
                       selected,
                       cap
                   )
 
-                  result[
+                  output[
                       "sports"
                   ][sport] = {
-                      "discovered": len(base),
-                      "selected": len(selected),
-                      "included": len(rows),
-                      "detail_failures": failures,
-                      "matches": rows,
+                      "discovered":
+                          len(base),
+                      "selected":
+                          len(selected),
+                      "included":
+                          len(rows),
+                      "detail_failures":
+                          failures,
+                      "matches":
+                          rows
                   }
 
-              return result
+              return output
 
           parser = argparse.ArgumentParser()
 
@@ -348,7 +370,7 @@ jobs:
 
           args = parser.parse_args()
 
-          payload = collect(
+          data = collect(
               args.mode
           )
 
@@ -358,7 +380,7 @@ jobs:
               encoding="utf-8"
           ) as fh:
               json.dump(
-                  payload,
+                  data,
                   fh,
                   ensure_ascii=False,
                   indent=2
